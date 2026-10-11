@@ -1,0 +1,7 @@
+/build/
+/managed_components/
+/components/esp-dl/
+/sdkconfig
+/sdkconfig.old
+/sdkconfig.*.old
+*.log

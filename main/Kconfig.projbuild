@@ -1,0 +1,10 @@
+menu "Security application"
+
+    config SECURITY_CAPTURE_ON_BOOT
+        bool "Capture and infer once after startup (development test)"
+        default n
+        help
+            Enqueue one PIR trigger after successful startup. Useful while the
+            sensor task is still a placeholder. Uses the same vision task.
+
+endmenu

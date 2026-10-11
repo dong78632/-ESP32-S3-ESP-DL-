@@ -1,0 +1,8 @@
+# Classic ESP-DL v2.0's own manifest requires ESP-IDF 5.0.x.
+dependencies:
+  idf: "5.0.*"
+  espressif/esp32-camera:
+    version: "2.0.16"
+  esp-dl:
+    git: https://github.com/espressif/esp-dl.git
+    version: "6f809f6513c71de204aa49eb41d2acced51eb1d7"
