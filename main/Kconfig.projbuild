@@ -4,7 +4,8 @@ menu "Security application"
         bool "Capture and infer once after startup (development test)"
         default n
         help
-            Enqueue one PIR trigger after successful startup. Useful while the
-            sensor task is still a placeholder. Uses the same vision task.
+            Enqueue one PIR trigger after successful startup without waiting
+            for physical PIR motion. Uses the same vision and alarm tasks;
+            a confirmed face also activates the real buzzer and LED outputs.
 
 endmenu

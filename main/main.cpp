@@ -60,7 +60,9 @@
 #define CAMERA_RESTART_DELAY_MS     1000
 
 /* Assumes active-high alarm outputs; adjust for the selected modules. */
+#define BUZZER_ACTIVE_LEVEL         1
 #define BUZZER_INACTIVE_LEVEL       0
+#define LED_ACTIVE_LEVEL            1
 #define LED_INACTIVE_LEVEL          0
 
 /* ESP-IDF xTaskCreate() stack sizes are specified in bytes. */
@@ -75,6 +77,12 @@
 /* Length 1 permits xQueueOverwrite(): repeated pending signals are coalesced. */
 #define SIGNAL_QUEUE_LENGTH        1
 #define SENSOR_POLL_PERIOD_MS      100
+#define PIR_ACTIVE_LEVEL           1
+#define PIR_DEBOUNCE_MS             30
+#define PIR_COOLDOWN_MS             2000
+#define ALARM_HALF_PERIOD_MS        250
+#define ALARM_CYCLE_COUNT           8
+#define ALARM_GPIO_RETRY_MS         1000
 #define APP_START_BIT              BIT0
 
 static constexpr float FACE_ALARM_SCORE_THRESHOLD = 0.7F;
@@ -127,15 +135,28 @@ static void sensor_task(void *arg)
 {
     (void)arg;
     wait_for_startup();
-    ESP_LOGI(TAG, "Sensor task started");
+    ESP_LOGI(TAG, "PIR task started: debounce=%d ms, cooldown=%d ms",
+             PIR_DEBOUNCE_MS, PIR_COOLDOWN_MS);
 
     for (;;) {
-        /* TODO: Read PIR, debounce, and detect a new motion trigger.
-         * When a trigger is confirmed, send this signal:
-         *
-         * app_signal_t signal = SIGNAL_PIR_TRIGGERED;
-         * xQueueOverwrite(s_vision_queue, &signal);
-         */
+        if (gpio_get_level(PIR_GPIO) == PIR_ACTIVE_LEVEL) {
+            /* Confirm a second high sample after a short debounce delay. */
+            vTaskDelay(pdMS_TO_TICKS(PIR_DEBOUNCE_MS));
+            if (gpio_get_level(PIR_GPIO) == PIR_ACTIVE_LEVEL) {
+                const app_signal_t signal = SIGNAL_PIR_TRIGGERED;
+                if (xQueueOverwrite(s_vision_queue, &signal) == pdPASS) {
+                    ESP_LOGI(TAG, "PIR motion confirmed; vision requested");
+                } else {
+                    ESP_LOGE(TAG, "Failed to enqueue PIR trigger");
+                }
+
+                /* Rate-limit confirmed levels, including a failed enqueue.
+                 * A sustained high level can trigger again after cooldown.
+                 */
+                vTaskDelay(pdMS_TO_TICKS(PIR_COOLDOWN_MS));
+                continue;
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_PERIOD_MS));
     }
 }
@@ -260,20 +281,74 @@ static void vision_task(void *arg)
     vTaskDelete(nullptr);
 }
 
+static bool set_alarm_gpio(gpio_num_t pin, int level)
+{
+    const esp_err_t err = gpio_set_level(pin, level);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set GPIO %d to %d: %s",
+                 static_cast<int>(pin), level, esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+static void ensure_alarm_outputs_off(void)
+{
+    for (;;) {
+        /* Always attempt both writes; do not short-circuit on the first error. */
+        const bool led_off = set_alarm_gpio(LED_GPIO, LED_INACTIVE_LEVEL);
+        const bool buzzer_off =
+            set_alarm_gpio(BUZZER_GPIO, BUZZER_INACTIVE_LEVEL);
+        if (led_off && buzzer_off) {
+            return;
+        }
+        ESP_LOGE(TAG, "Alarm outputs could not be switched off; retrying");
+        vTaskDelay(pdMS_TO_TICKS(ALARM_GPIO_RETRY_MS));
+    }
+}
+
 static void alarm_task(void *arg)
 {
     (void)arg;
     wait_for_startup();
+    ensure_alarm_outputs_off();
     ESP_LOGI(TAG, "Alarm task started");
 
     app_signal_t signal;
     for (;;) {
-        if (xQueueReceive(s_alarm_queue, &signal, portMAX_DELAY) == pdTRUE &&
-            signal == SIGNAL_HUMAN_CONFIRMED) {
-            ESP_LOGI(TAG, "Human confirmation received; alarm logic pending");
-
-            /* TODO: Drive buzzer/LED, then restore their inactive levels. */
+        if (xQueueReceive(s_alarm_queue, &signal, portMAX_DELAY) != pdTRUE ||
+            signal != SIGNAL_HUMAN_CONFIRMED) {
+            continue;
         }
+
+        ESP_LOGI(TAG, "Alarm started: duration approximately %d ms",
+                 ALARM_CYCLE_COUNT * 2 * ALARM_HALF_PERIOD_MS);
+        /* Active buzzer sounds continuously; LED flashes at 250 ms per phase. */
+        bool alarm_ok = set_alarm_gpio(BUZZER_GPIO, BUZZER_ACTIVE_LEVEL);
+        if (alarm_ok) {
+            for (int cycle = 0; cycle < ALARM_CYCLE_COUNT; ++cycle) {
+                if (!set_alarm_gpio(LED_GPIO, LED_ACTIVE_LEVEL)) {
+                    alarm_ok = false;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(ALARM_HALF_PERIOD_MS));
+
+                if (!set_alarm_gpio(LED_GPIO, LED_INACTIVE_LEVEL)) {
+                    alarm_ok = false;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(ALARM_HALF_PERIOD_MS));
+            }
+        }
+
+        /* Common cleanup for normal completion and every GPIO-write error. */
+        ensure_alarm_outputs_off();
+        if (alarm_ok) {
+            ESP_LOGI(TAG, "Alarm finished; LED and buzzer are off");
+        } else {
+            ESP_LOGE(TAG, "Alarm aborted after GPIO error; outputs are off");
+        }
+        /* A single coalesced confirmation may already be waiting in the queue. */
     }
 }
 
@@ -432,7 +507,7 @@ extern "C" void app_main(void)
     xEventGroupSetBits(s_start_event, APP_START_BIT);
     ESP_LOGI(TAG, "Framework ready: sensor -> face vision -> alarm");
 #if CONFIG_SECURITY_CAPTURE_ON_BOOT
-    /* Optional development trigger; sensor_task remains a placeholder. */
+    /* Optional development trigger using the same path as a real PIR event. */
     {
         const app_signal_t test_signal = SIGNAL_PIR_TRIGGERED;
         if (xQueueOverwrite(s_vision_queue, &test_signal) != pdPASS) {
