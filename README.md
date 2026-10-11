@@ -45,6 +45,7 @@ ESP-DL v2.0 自身的 `idf_component.yml` 指定 `idf: "5.0.*"`。
 
 `main.c` 已切换为 `main.cpp`，入口为 `extern "C" void app_main(void)`。
 初始化结构体使用零初始化后逐字段赋值，兼容 C++17。
+第三步的完整核心代码片段与本地组件链接说明见 [docs/step3.md](docs/step3.md)。
 
 ## 依赖和编译
 
