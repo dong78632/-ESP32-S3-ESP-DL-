@@ -2,10 +2,12 @@
 
 毕业设计题目：**基于 ESP32-S3 与 ESP-DL 的端侧人体检测智能安防报警系统设计与实现**。
 
-当前为第四步开发快照：FreeRTOS 框架、OV2640 初始化/采集、经典 ESP-DL
-两阶段人脸检测、PIR 防抖触发及有源蜂鸣器/LED 报警已经接入。PIR 二次采样
-确认间隔为 30 ms，触发冷却期为 2 秒；LED 每 250 ms 切换一次，有源蜂鸣器
-持续鸣叫，单轮报警约 4 秒，结束后关闭两路输出。
+当前为第五步开发快照：FreeRTOS 框架、OV2640 初始化/采集、经典 ESP-DL
+两阶段人脸检测、PIR 防抖触发、有源蜂鸣器/LED 报警，以及 Wi-Fi STA 与
+MQTT QoS 1 报警推送已经接入。系统取得 IPv4 地址后才启动 MQTT 和检测任务；
+检测确认后向 `esp32s3/security/alert` 发布 JSON，同时执行约 4 秒声光报警。
+已加入 40–240 MHz 动态调频与自动 Light Sleep；摄像头按触发初始化和关闭，
+采集/推理期间锁定 240 MHz 并禁止睡眠，空闲时由 Wi-Fi/FreeRTOS 协调睡眠。
 **当前模型检测人脸，不能将这一阶段的效果表述为全身人体或行人检测。**
 最终若要求识别背影、遮脸或画面内仅出现身体，需要接入真正的行人/人体模型，
 并随模型选择调整 SDK、预处理与阈值，不能只更换类名。
@@ -38,7 +40,12 @@ ESP-DL v2.0 自身的 `idf_component.yml` 指定 `idf: "5.0.*"`。
 │   └── README.md
 ├── docs/
 │   ├── step3.md
-│   └── step4.md
+│   ├── step4.md
+│   ├── step5.md
+│   ├── power-management.md
+│   └── hardware-bringup.md
+├── tests/
+│   └── test_power_lifecycle.py
 └── main/
     ├── CMakeLists.txt
     ├── idf_component.yml
@@ -51,6 +58,12 @@ ESP-DL v2.0 自身的 `idf_component.yml` 指定 `idf: "5.0.*"`。
 第三步的完整核心代码片段与本地组件链接说明见 [docs/step3.md](docs/step3.md)。
 第四步的传感器/报警任务实现、运行时序及上板检查步骤见
 [docs/step4.md](docs/step4.md)。
+第五步的 Wi-Fi、MQTT、JSON 内存管理及联调方法见
+[docs/step5.md](docs/step5.md)。
+自动 Light Sleep 的配置、摄像头生命周期与功耗验证见
+[docs/power-management.md](docs/power-management.md)。
+从零采购、电脑准备、接线及分阶段联调见
+[docs/hardware-bringup.md](docs/hardware-bringup.md)。
 
 ## 依赖和编译
 
@@ -87,6 +100,9 @@ manifest 中的 `esp-dl` Git 依赖，保留 `REQUIRES esp-dl`。详见
    增加少量代码/内存开销。若已有 `sdkconfig`，默认文件不会覆盖其中的值，
    必须到 menuconfig 确认。
 4. **接线**：摄像头引脚不是 ESP32-S3-WROOM 的统一标准，须对照实际板卡。
+5. **自动睡眠**：确认 `CONFIG_PM_ENABLE=y` 和
+   `CONFIG_FREERTOS_USE_TICKLESS_IDLE=y`。二者已写入 `sdkconfig.defaults`；
+   若已有 `sdkconfig`，仍需在 menuconfig 中启用，默认文件不会覆盖已有值。
 
 | 信号 | 暂定 GPIO |
 | --- | --- |
@@ -97,12 +113,16 @@ manifest 中的 `esp-dl` Git 依赖，保留 `REQUIRES esp-dl`。详见
 | Y5 / Y4 / Y3 / Y2 | 16 / 18 / 17 / 15 |
 | VSYNC / HREF / PCLK | 38 / 47 / 13 |
 
-摄像头 XCLK 占用 `LEDC_TIMER_0` 和 `LEDC_CHANNEL_0`，后续 PWM 蜂鸣器
-需要使用其他资源。本阶段使用有源蜂鸣器，不需要 PWM；蜂鸣器和 LED
+ESP32-S3 的摄像头驱动通过 LCD_CAM 生成 XCLK；配置结构中的 LEDC 字段保留
+用于驱动兼容。本阶段使用有源蜂鸣器，不需要 PWM；蜂鸣器和 LED
 按高电平有效配置。有源蜂鸣器的控制输入需兼容 3.3 V；裸蜂鸣器按额定
 电流选择三极管/MOSFET 驱动，LED 串联限流电阻，所有模块共地。
 
-## 第四步验证
+## 第五步验证
+
+烧录前先在 `main/main.cpp` 中替换 `WIFI_SSID` 和 `WIFI_PASS` 占位符。
+公共 Broker 和主题仅适合开发验证；多人可能发布或订阅相同主题，正式部署
+应改用带认证与 TLS 的私有 Broker，并为每台设备设置唯一主题。
 
 默认由真实 PIR 高电平触发视觉任务。HC-SR501 上电后先等待约 30–60 秒
 稳定，再测试移动触发。PIR 持续为高电平时，冷却后会再次确认并请求检测。
@@ -125,6 +145,8 @@ PIR 确认后应看到 `PIR motion confirmed; vision requested`。画面出现�
 人脸时，应看到 `Alarm started`，LED 亮/灭各 250 ms，蜂鸣器持续鸣叫，
 约 4 秒后看到 `Alarm finished; LED and buzzer are off`。随后两路输出
 恢复低电平；报警期间新增的确认信号最多保留一个，可能立即启动下一轮。
+同时可用 MQTT 客户端订阅 `esp32s3/security/alert`，核对收到的设备名、
+报警类型和自启动以来的微秒时间戳。具体步骤及示例载荷见第五步文档。
 
 背对摄像头不应作为这一人脸模型必须检出的测试用例。阈值 0.7 是初始值，
 不是已标定的准确率，也不代表“70% 识别准确率”。详细检查见第四步文档。
@@ -132,6 +154,9 @@ PIR 确认后应看到 `PIR motion confirmed; vision requested`。画面出现�
 ## 帧和任务资源约定
 
 - 视觉任务独占模型对象和帧消费过程；检测器在任务循环外构造一次。
+- 摄像头启动检查及每次采集/推理均持有 CPU 最大频率锁和禁止 Light Sleep
+  锁。每轮按“归还帧 → 反初始化摄像头 → 释放电源锁”的顺序退出；空闲等待
+  队列时不持有这两把锁，摄像头 DMA/VSYNC 任务也已停止。
 - 每个非空帧由 `CameraFrameGuard` 归还一次。正常路径、检查失败的
   `continue`、C++ 异常展开都执行 `esp_camera_fb_return()`。
 - `fb` 与 `fb->buf` 属于摄像头驱动，不调用 `free()`。归还帧后不再访问它们。
@@ -141,8 +166,11 @@ PIR 确认后应看到 `PIR motion confirmed; vision requested`。画面出现�
 - PIR/报警任务使用 `vTaskDelay()` 让出 CPU，不忙等，也不申请图像缓冲区。
 - 报警正常结束或 GPIO 激活/闪烁失败均执行关闭流程；关闭任一路输出失败
   时，每秒重试两路关闭，不开始新的报警轮次。
+- 每次网络报警创建一个 cJSON 对象和序列化字符串；所有成功与失败路径最终
+  都调用 `free()` 和 `cJSON_Delete()`，不跨报警轮次保留载荷指针。
 - 启动事件位只在三个任务全部创建成功后设置。启动失败时任务尚未初始化
-  模型，可以先删任务、再释放队列/事件组并反初始化摄像头。
+  模型，可以先删任务、再释放队列/事件组及未持有的电源锁。摄像头启动检查
+  已在创建任务前完成关闭。
 - 不可在运行期直接调用这段“启动失败清理”；FreeRTOS 外部删除 C++ 任务
   不会自动展开任务栈上的对象。运行期停机需要另行实现协作式退出。
 
@@ -152,13 +180,15 @@ PIR 确认后应看到 `PIR motion confirmed; vision requested`。画面出现�
 
 ## 当前验证状态和下一步
 
-已对照官方 v2.0 头文件、示例、组件 CMake 和 manifest 检查构造参数、
-RGB565 输入类型、结果结构及链接关系，并审阅第四步的触发、防抖、冷却、
-报警时序和 GPIO 错误关闭路径。本机未安装 ESP-IDF/Xtensa 工具链，也没有
-实物，尚未完成固件交叉编译、链接、上板推理、实际电平或准确率测量。
+已对照现有 ESP-IDF 5.0.x 版本约束检查 Wi-Fi/MQTT API、官方组件依赖、
+启动顺序及 JSON 释放路径，并保留前四步的触发、推理和安全关闭逻辑。
+自动睡眠实现已核对 ESP-IDF v5.0.6 PM 接口和摄像头 v2.0.16 驱动；主机测试
+验证了正常、空帧、初始化失败、提前退出、异常和 1000 次循环的资源释放。
+本机未安装 ESP-IDF/Xtensa 工具链，也没有实物，尚未完成固件交叉编译、
+链接、上板联网、Broker 收发、睡眠占比、功耗、实际电平或准确率测量。
 
-后续模块：可选 Wi-Fi/MQTT；真正的全身人体模型；连续触发稳定性与
-内存测量；根据实际硬件与场景调整 PIR 及报警策略。
+后续可选增强：真正的全身人体模型；MQTTS、Broker 鉴权与唯一设备主题；
+连续触发稳定性与内存测量；根据实际硬件与场景调整 PIR 及报警策略。
 
 官方依据：
 

@@ -1,22 +1,30 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <inttypes.h>
 #include <list>
 #include <new>
 #include <vector>
 
+#include "cJSON.h"
 #include "driver/gpio.h"
 #include "esp_camera.h"
 #include "esp_err.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_pm.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "mqtt_client.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
@@ -26,6 +34,10 @@
 
 #if !CONFIG_COMPILER_CXX_EXCEPTIONS
 #error "Enable CONFIG_COMPILER_CXX_EXCEPTIONS for model/STL allocation handling"
+#endif
+
+#if !CONFIG_PM_ENABLE || !CONFIG_FREERTOS_USE_TICKLESS_IDLE
+#error "Enable CONFIG_PM_ENABLE and CONFIG_FREERTOS_USE_TICKLESS_IDLE"
 #endif
 
 /* Example pins: confirm board availability and OV2640 pin assignments first. */
@@ -59,6 +71,16 @@
 #define CAMERA_XCLK_FREQ_HZ         20000000
 #define CAMERA_RESTART_DELAY_MS     1000
 
+/* Replace these placeholders before flashing the board. */
+#define WIFI_SSID                   "YOUR_WIFI_SSID"
+#define WIFI_PASS                   "YOUR_WIFI_PASSWORD"
+#define MQTT_BROKER_URI             "mqtt://broker.emqx.io"
+#define MQTT_TOPIC                  "esp32s3/security/alert"
+#define MAX_RETRY                   5
+#define NETWORK_RESTART_DELAY_MS    3000
+#define PM_MAX_CPU_FREQ_MHZ         240
+#define PM_MIN_CPU_FREQ_MHZ         40
+
 /* Assumes active-high alarm outputs; adjust for the selected modules. */
 #define BUZZER_ACTIVE_LEVEL         1
 #define BUZZER_INACTIVE_LEVEL       0
@@ -68,7 +90,7 @@
 /* ESP-IDF xTaskCreate() stack sizes are specified in bytes. */
 #define SENSOR_TASK_STACK_SIZE     2048
 #define VISION_TASK_STACK_SIZE     8192
-#define ALARM_TASK_STACK_SIZE      2048
+#define ALARM_TASK_STACK_SIZE      4096
 
 #define SENSOR_TASK_PRIORITY       5
 #define VISION_TASK_PRIORITY       4
@@ -84,6 +106,8 @@
 #define ALARM_CYCLE_COUNT           8
 #define ALARM_GPIO_RETRY_MS         1000
 #define APP_START_BIT              BIT0
+#define WIFI_CONNECTED_BIT         BIT0
+#define WIFI_FAIL_BIT              BIT1
 
 static constexpr float FACE_ALARM_SCORE_THRESHOLD = 0.7F;
 static constexpr float MSR_SCORE_THRESHOLD = 0.1F;
@@ -104,7 +128,57 @@ typedef enum {
 static QueueHandle_t s_vision_queue;
 static QueueHandle_t s_alarm_queue;
 static EventGroupHandle_t s_start_event;
+static EventGroupHandle_t s_wifi_event_group;
 static TaskHandle_t s_task_handles[3];
+static int s_wifi_retry_count;
+static esp_event_handler_instance_t s_wifi_any_id_instance;
+static esp_event_handler_instance_t s_wifi_got_ip_instance;
+static esp_mqtt_client_handle_t mqtt_client = nullptr;
+static esp_pm_lock_handle_t s_vision_cpu_lock;
+static esp_pm_lock_handle_t s_camera_awake_lock;
+
+static esp_err_t init_camera(void);
+
+/* These locks are only used by app_main before startup, then by vision_task. */
+class VisionPowerGuard {
+public:
+    VisionPowerGuard() noexcept
+    {
+        ESP_ERROR_CHECK(esp_pm_lock_acquire(s_camera_awake_lock));
+        ESP_ERROR_CHECK(esp_pm_lock_acquire(s_vision_cpu_lock));
+    }
+    ~VisionPowerGuard()
+    {
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_vision_cpu_lock));
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_camera_awake_lock));
+    }
+    VisionPowerGuard(const VisionPowerGuard &) = delete;
+    VisionPowerGuard &operator=(const VisionPowerGuard &) = delete;
+};
+
+/* Declare after VisionPowerGuard, but before CameraFrameGuard, in each scope. */
+class CameraSessionGuard {
+public:
+    CameraSessionGuard() noexcept = default;
+    esp_err_t start()
+    {
+        const esp_err_t err = init_camera();
+        initialized_ = (err == ESP_OK);
+        return err;
+    }
+    ~CameraSessionGuard()
+    {
+        if (initialized_) {
+            /* Stop DMA/VSYNC before permitting sleep; the frame is returned first. */
+            ESP_ERROR_CHECK(esp_camera_deinit());
+        }
+    }
+    CameraSessionGuard(const CameraSessionGuard &) = delete;
+    CameraSessionGuard &operator=(const CameraSessionGuard &) = delete;
+
+private:
+    bool initialized_ = false;
+};
 
 /* Driver owns both the frame descriptor and its pixel buffer. */
 class CameraFrameGuard {
@@ -185,6 +259,15 @@ static void vision_task(void *arg)
 
             size_t confirmed_faces = 0;
             try {
+                /* Lock across initialization, capture, inference and deinit. */
+                VisionPowerGuard power;
+                CameraSessionGuard camera;
+                const esp_err_t camera_err = camera.start();
+                if (camera_err != ESP_OK) {
+                    ESP_LOGE(TAG, "Camera initialization failed: %s",
+                             esp_err_to_name(camera_err));
+                    continue;
+                }
                 CameraFrameGuard frame(esp_camera_fb_get());
                 camera_fb_t *fb = frame.get();
                 if (fb == nullptr) {
@@ -249,7 +332,7 @@ static void vision_task(void *arg)
                          elapsed_us, static_cast<double>(elapsed_us) / 1000.0,
                          candidates.size(), results.size(), confirmed_faces);
             } catch (const std::bad_alloc &) {
-                /* Frame guard has already returned the frame during unwinding. */
+                /* Frame, camera session and PM locks have already unwound. */
                 ESP_LOGE(TAG, "Insufficient memory during face inference");
                 continue;
             } catch (const std::exception &error) {
@@ -260,7 +343,7 @@ static void vision_task(void *arg)
                 continue;
             }
 
-            /* Frame has been returned before notifying the alarm task. */
+            /* Frame returned, camera deinitialized and PM locks released. */
             if (confirmed_faces > 0) {
                 const app_signal_t alarm_signal = SIGNAL_HUMAN_CONFIRMED;
                 if (xQueueOverwrite(s_alarm_queue, &alarm_signal) != pdPASS) {
@@ -307,6 +390,45 @@ static void ensure_alarm_outputs_off(void)
     }
 }
 
+static void publish_mqtt_alert(void)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (root == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate MQTT alert JSON object");
+        return;
+    }
+
+    char *payload = nullptr;
+    const int64_t timestamp_us = esp_timer_get_time();
+    const bool json_ok =
+        cJSON_AddStringToObject(root, "device", "ESP32-S3") != nullptr &&
+        cJSON_AddStringToObject(root, "alert", "Human Detected") != nullptr &&
+        cJSON_AddNumberToObject(root, "timestamp",
+                                static_cast<double>(timestamp_us)) != nullptr;
+    if (json_ok) {
+        payload = cJSON_PrintUnformatted(root);
+    }
+
+    if (payload == nullptr) {
+        ESP_LOGE(TAG, "Failed to build MQTT alert JSON payload");
+    } else if (mqtt_client == nullptr) {
+        ESP_LOGW(TAG, "MQTT client is unavailable; alert was not published");
+    } else {
+        const int message_id = esp_mqtt_client_publish(
+            mqtt_client, MQTT_TOPIC, payload, 0, 1, 0);
+        if (message_id < 0) {
+            ESP_LOGE(TAG, "Failed to enqueue MQTT alert");
+        } else {
+            ESP_LOGI(TAG, "MQTT alert queued: message_id=%d, payload=%s",
+                     message_id, payload);
+        }
+    }
+
+    /* cJSON_PrintUnformatted() uses malloc with the default cJSON hooks. */
+    free(payload);
+    cJSON_Delete(root);
+}
+
 static void alarm_task(void *arg)
 {
     (void)arg;
@@ -323,6 +445,8 @@ static void alarm_task(void *arg)
 
         ESP_LOGI(TAG, "Alarm started: duration approximately %d ms",
                  ALARM_CYCLE_COUNT * 2 * ALARM_HALF_PERIOD_MS);
+        publish_mqtt_alert();
+
         /* Active buzzer sounds continuously; LED flashes at 250 ms per phase. */
         bool alarm_ok = set_alarm_gpio(BUZZER_GPIO, BUZZER_ACTIVE_LEVEL);
         if (alarm_ok) {
@@ -352,6 +476,135 @@ static void alarm_task(void *arg)
     }
 }
 
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    (void)arg;
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        const esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Initial WiFi connect request failed: %s",
+                     esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        if (s_wifi_retry_count < MAX_RETRY) {
+            ++s_wifi_retry_count;
+            ESP_LOGW(TAG, "WiFi disconnected; reconnecting (%d/%d)",
+                     s_wifi_retry_count, MAX_RETRY);
+            const esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "WiFi reconnect request failed: %s",
+                         esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGE(TAG, "WiFi connection failed after %d retries", MAX_RETRY);
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+        return;
+    }
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const auto *event = static_cast<ip_event_got_ip_t *>(event_data);
+        ESP_LOGI(TAG, "WiFi connected, IP=" IPSTR, IP2STR(&event->ip_info.ip));
+        s_wifi_retry_count = 0;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static bool wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+    if (s_wifi_event_group == nullptr) {
+        ESP_LOGE(TAG, "Failed to create WiFi event group");
+        return false;
+    }
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    if (esp_netif_create_default_wifi_sta() == nullptr) {
+        ESP_LOGE(TAG, "Failed to create default WiFi station interface");
+        return false;
+    }
+
+    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init_config));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr,
+        &s_wifi_any_id_instance));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr,
+        &s_wifi_got_ip_instance));
+
+    wifi_config_t wifi_config{};
+    std::strncpy(reinterpret_cast<char *>(wifi_config.sta.ssid), WIFI_SSID,
+                 sizeof(wifi_config.sta.ssid) - 1);
+    std::strncpy(reinterpret_cast<char *>(wifi_config.sta.password), WIFI_PASS,
+                 sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.pmf_cfg.capable = true;
+    wifi_config.sta.pmf_cfg.required = false;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    /* WiFi manages its own sleep/wakeup schedule while staying associated. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
+
+    ESP_LOGI(TAG, "Waiting for WiFi SSID '%s'", WIFI_SSID);
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE,
+        pdFALSE, portMAX_DELAY);
+    return (bits & WIFI_CONNECTED_BIT) != 0;
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    (void)handler_args;
+    (void)base;
+    const auto *event = static_cast<esp_mqtt_event_handle_t>(event_data);
+
+    switch (static_cast<esp_mqtt_event_id_t>(event_id)) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT connected to %s", MQTT_BROKER_URI);
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "MQTT disconnected; client will reconnect automatically");
+        break;
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "MQTT QoS message acknowledged: message_id=%d",
+                 event->msg_id);
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "MQTT transport error");
+        break;
+    default:
+        break;
+    }
+}
+
+static void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_config{};
+    mqtt_config.broker.address.uri = MQTT_BROKER_URI;
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_config);
+    if (mqtt_client == nullptr) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client");
+        return;
+    }
+
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(
+        mqtt_client, ESP_EVENT_ANY_ID, &mqtt_event_handler, nullptr));
+    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
+}
+
 static void init_nvs(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -362,6 +615,23 @@ static void init_nvs(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+}
+
+static void init_power_management(void)
+{
+    /* ESP-IDF 5.0.x uses the chip-specific PM configuration type. */
+    esp_pm_config_esp32s3_t pm_config{};
+    pm_config.max_freq_mhz = PM_MAX_CPU_FREQ_MHZ;
+    pm_config.min_freq_mhz = PM_MIN_CPU_FREQ_MHZ;
+    pm_config.light_sleep_enable = true;
+    ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+
+    ESP_ERROR_CHECK(esp_pm_lock_create(
+        ESP_PM_CPU_FREQ_MAX, 0, "vision_cpu", &s_vision_cpu_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_create(
+        ESP_PM_NO_LIGHT_SLEEP, 0, "camera_awake", &s_camera_awake_lock));
+    ESP_LOGI(TAG, "Power management ready: CPU %d-%d MHz, automatic light sleep",
+             PM_MIN_CPU_FREQ_MHZ, PM_MAX_CPU_FREQ_MHZ);
 }
 
 static void init_gpio(void)
@@ -410,7 +680,7 @@ static esp_err_t init_camera(void)
     camera_config.pin_pclk = CAM_PIN_PCLK;
 
     camera_config.xclk_freq_hz = CAMERA_XCLK_FREQ_HZ;
-    /* Reserve this LEDC timer/channel for camera XCLK. */
+    /* Compatibility fields; the ESP32-S3 driver generates XCLK via LCD_CAM. */
     camera_config.ledc_timer = LEDC_TIMER_0;
     camera_config.ledc_channel = LEDC_CHANNEL_0;
     camera_config.pixel_format = PIXFORMAT_RGB565;
@@ -454,20 +724,40 @@ static void cleanup_startup_resources(void)
         s_start_event = nullptr;
     }
 
-    /* Startup tasks have no application buffers to release at this stage. */
-    esp_err_t err = esp_camera_deinit();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to deinitialize camera: %s", esp_err_to_name(err));
+    /* Camera startup validation is already closed; tasks cannot hold locks yet. */
+    if (s_vision_cpu_lock != nullptr) {
+        ESP_ERROR_CHECK(esp_pm_lock_delete(s_vision_cpu_lock));
+        s_vision_cpu_lock = nullptr;
+    }
+    if (s_camera_awake_lock != nullptr) {
+        ESP_ERROR_CHECK(esp_pm_lock_delete(s_camera_awake_lock));
+        s_camera_awake_lock = nullptr;
     }
 }
 
 extern "C" void app_main(void)
 {
+    init_power_management();
     init_nvs();
     init_gpio();
 
-    /* Initialize the driver before any task can acquire a camera frame. */
-    esp_err_t err = init_camera();
+    /* Do not start sensing until the station has obtained an IPv4 address. */
+    if (!wifi_init_sta()) {
+        ESP_LOGE(TAG, "WiFi startup failed; restarting in %d ms",
+                 NETWORK_RESTART_DELAY_MS);
+        vTaskDelay(pdMS_TO_TICKS(NETWORK_RESTART_DELAY_MS));
+        esp_restart();
+        return;
+    }
+    mqtt_app_start();
+
+    /* Validate the camera under locks, then leave it deinitialized during idle. */
+    esp_err_t err;
+    {
+        VisionPowerGuard power;
+        CameraSessionGuard camera;
+        err = camera.start();
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera initialization failed: %s (0x%x); "
                       "restarting in %d ms",
@@ -477,6 +767,7 @@ extern "C" void app_main(void)
         esp_restart();
         return;
     }
+    ESP_LOGI(TAG, "Camera ready for on-demand capture; idle sleep is permitted");
 
     s_vision_queue = xQueueCreate(SIGNAL_QUEUE_LENGTH, sizeof(app_signal_t));
     s_alarm_queue = xQueueCreate(SIGNAL_QUEUE_LENGTH, sizeof(app_signal_t));
@@ -505,7 +796,7 @@ extern "C" void app_main(void)
 
     /* Past this point cleanup_startup_resources() must never be called. */
     xEventGroupSetBits(s_start_event, APP_START_BIT);
-    ESP_LOGI(TAG, "Framework ready: sensor -> face vision -> alarm");
+    ESP_LOGI(TAG, "Framework ready: sensor -> face vision -> alarm + MQTT");
 #if CONFIG_SECURITY_CAPTURE_ON_BOOT
     /* Optional development trigger using the same path as a real PIR event. */
     {
