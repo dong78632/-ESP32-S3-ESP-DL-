@@ -17,3 +17,9 @@ CONFIG_ESP32S3_DATA_CACHE_64KB=y
 # This table fits a 4 MB Flash part; select actual Flash size in menuconfig.
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Bound MQTT's own retry lifetime as well as the application's alert queue.
+CONFIG_MQTT_USE_CUSTOM_CONFIG=y
+CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS=300000
+CONFIG_MQTT_REPORT_DELETED_MESSAGES=y

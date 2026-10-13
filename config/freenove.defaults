@@ -1,0 +1,5 @@
+# Verify your Freenove board revision and actual Octal PSRAM module first.
+CONFIG_SECURITY_BOARD_FREENOVE=y
+CONFIG_SPIRAM_MODE_OCT=y
+# Establish the hardware baseline without automatic sleep, then enable it.
+CONFIG_SECURITY_AUTO_LIGHT_SLEEP=n

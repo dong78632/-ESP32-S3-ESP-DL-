@@ -1,0 +1,66 @@
+#pragma once
+
+#include "sdkconfig.h"
+
+/* Copy security_secrets.example.h to security_secrets.h (Git-ignored). */
+#if __has_include("security_secrets.h")
+#include "security_secrets.h"
+#endif
+#ifndef WIFI_SSID
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS "YOUR_WIFI_PASSWORD"
+#endif
+#ifndef MQTT_BROKER_URI
+#define MQTT_BROKER_URI "mqtt://broker.emqx.io"
+#endif
+#ifndef MQTT_TOPIC
+#define MQTT_TOPIC "esp32s3/security/alert"
+#endif
+
+#define PIR_GPIO static_cast<gpio_num_t>(CONFIG_SECURITY_PIR_GPIO)
+#define BUZZER_GPIO static_cast<gpio_num_t>(CONFIG_SECURITY_BUZZER_GPIO)
+#define LED_GPIO static_cast<gpio_num_t>(CONFIG_SECURITY_LED_GPIO)
+#if CONFIG_SECURITY_BOARD_FREENOVE
+#define CAM_PIN_PWDN  (-1)
+#define CAM_PIN_RESET (-1)
+#define CAM_PIN_XCLK  15
+#define CAM_PIN_SIOD  4
+#define CAM_PIN_SIOC  5
+#define CAM_PIN_Y9    16
+#define CAM_PIN_Y8    17
+#define CAM_PIN_Y7    18
+#define CAM_PIN_Y6    12
+#define CAM_PIN_Y5    10
+#define CAM_PIN_Y4    8
+#define CAM_PIN_Y3    9
+#define CAM_PIN_Y2    11
+#define CAM_PIN_VSYNC 6
+#define CAM_PIN_HREF  7
+#define CAM_PIN_PCLK  13
+#else
+#define CAM_PIN_PWDN  CONFIG_SECURITY_CAM_PWDN
+#define CAM_PIN_RESET CONFIG_SECURITY_CAM_RESET
+#define CAM_PIN_XCLK  CONFIG_SECURITY_CAM_XCLK
+#define CAM_PIN_SIOD  CONFIG_SECURITY_CAM_SDA
+#define CAM_PIN_SIOC  CONFIG_SECURITY_CAM_SCL
+#define CAM_PIN_Y9    CONFIG_SECURITY_CAM_D7
+#define CAM_PIN_Y8    CONFIG_SECURITY_CAM_D6
+#define CAM_PIN_Y7    CONFIG_SECURITY_CAM_D5
+#define CAM_PIN_Y6    CONFIG_SECURITY_CAM_D4
+#define CAM_PIN_Y5    CONFIG_SECURITY_CAM_D3
+#define CAM_PIN_Y4    CONFIG_SECURITY_CAM_D2
+#define CAM_PIN_Y3    CONFIG_SECURITY_CAM_D1
+#define CAM_PIN_Y2    CONFIG_SECURITY_CAM_D0
+#define CAM_PIN_VSYNC CONFIG_SECURITY_CAM_VSYNC
+#define CAM_PIN_HREF  CONFIG_SECURITY_CAM_HREF
+#define CAM_PIN_PCLK  CONFIG_SECURITY_CAM_PCLK
+#endif
+
+#define BUZZER_ACTIVE_LEVEL CONFIG_SECURITY_BUZZER_ACTIVE_LEVEL
+#define BUZZER_INACTIVE_LEVEL (1 - BUZZER_ACTIVE_LEVEL)
+#define LED_ACTIVE_LEVEL CONFIG_SECURITY_LED_ACTIVE_LEVEL
+#define LED_INACTIVE_LEVEL (1 - LED_ACTIVE_LEVEL)
+#define PIR_WARMUP_MS CONFIG_SECURITY_PIR_WARMUP_MS
+#define CAMERA_WARMUP_FRAMES CONFIG_SECURITY_CAMERA_WARMUP_FRAMES

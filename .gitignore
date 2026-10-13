@@ -1,7 +1,11 @@
 /build/
+/build-*/
 /managed_components/
 /components/esp-dl/
 /sdkconfig
 /sdkconfig.old
 /sdkconfig.*.old
 *.log
+/main/security_secrets.h
+/sdkconfig.*.local
+__pycache__/

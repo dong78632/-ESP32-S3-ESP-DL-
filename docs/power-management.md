@@ -1,6 +1,6 @@
 # 自动 Light Sleep 与动态调频
 
-本实现沿用传感器、视觉、报警三个任务和 Wi-Fi/MQTT。`app_main()` 开头
+本实现沿用传感器、视觉、报警任务，加上网络监督和 MQTT 工作任务。`app_main()`
 调用 `esp_pm_configure()`，设置最大 CPU 频率 240 MHz、最小频率 40 MHz，
 并允许系统在满足空闲条件时自动 Light Sleep。Wi-Fi 使用
 `WIFI_PS_MIN_MODEM`，驱动按路由器的 DTIM 节奏协调无线电睡眠和唤醒，
@@ -17,7 +17,8 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 
 对于已有 `sdkconfig`，执行 `idf.py menuconfig`，按 `/` 搜索 `PM_ENABLE`
 和 `FREERTOS_USE_TICKLESS_IDLE` 并启用，然后构建。Tickless Idle 是必要
-条件；缺少这两个配置时，本工程会在编译期给出明确错误。
+条件。首次联调在 `Security application` 关闭 `Enable automatic light sleep`，
+即可保留动态调频而禁用睡眠；也支持关闭 PM 的构建，此时守卫不申请电源锁。
 
 本工程固定 ESP-IDF 5.0.x，使用该版本的 `esp_pm_config_esp32s3_t`：
 
@@ -25,6 +26,7 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 esp_pm_config_esp32s3_t pm_config{};
 pm_config.max_freq_mhz = 240;
 pm_config.min_freq_mhz = 40;
+// 由 CONFIG_SECURITY_AUTO_LIGHT_SLEEP 控制，关闭时为 false。
 pm_config.light_sleep_enable = true;
 ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
 ```
@@ -53,6 +55,12 @@ ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
 锁操作失败则由 `ESP_ERROR_CHECK` 停止当前执行，避免继续在不安全状态睡眠。
 启动阶段也在同样的锁保护下检查摄像头并立即关闭。
 
+ESP-IDF 的 `CONFIG_PM_SLP_DISABLE_GPIO` 可能在每次自动睡眠时隔离 GPIO。
+报警 GPIO 初始化后分别调用 `gpio_sleep_sel_dis()`，让 LED/蜂鸣器在任务
+`vTaskDelay()` 期间保持输出，并保持空闲关闭电平。否则持续蜂鸣可能中断，
+低电平有效模块也可能因引脚浮空而误触发。复位/上电到 GPIO 初始化前的电平
+仍需外部上拉/下拉和驱动电路保证，软件无法覆盖这段时间。
+
 ## 延迟与功耗边界
 
 FreeRTOS 定时唤醒仍支持现有 100 ms PIR 轮询，不需要额外接线。这里没有
@@ -74,12 +82,14 @@ PSRAM、外设、信号强度及路由器配置。
 
 ```sh
 python3 tests/test_power_lifecycle.py
+python3 tests/test_runtime_policy.py
+python3 tests/test_mqtt_cleanup.py
 git diff --check
 ```
 
 测试直接提取生产代码中的三个 RAII 类，用 C++17 编译并模拟 API 调用，
 验证清理顺序、异常/失败路径和 1000 次连续循环。主机模拟不能验证真实
-ESP32 的睡眠、驱动并发或无线电行为；当前服务器没有 Xtensa/ESP-IDF 工具链。
+ESP32 的睡眠、驱动并发或无线电行为。实际交叉编译状态见 [审查报告](project-audit.md)。
 
 上板后检查：
 

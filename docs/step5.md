@@ -1,22 +1,24 @@
 # 第五步：Wi-Fi 与 MQTT 报警推送
 
-本阶段在第四步声光闭环上增加 Wi-Fi STA 和 MQTT。`app_main()` 初始化 NVS
-后阻塞等待 Wi-Fi 获取 IPv4 地址，随后启动 MQTT 客户端，再检查摄像头并
-创建传感器、视觉和报警任务。启动连接连续失败 5 次时，设备延时 3 秒重启。
+启动顺序：电源/GPIO/NVS → Wi-Fi 初始化和等待 IP（最多 30 秒）→ 摄像头检查
+→ 创建本地应用任务。MQTT 客户端句柄在网络监督任务创建前初始化一次；仅在
+首次获取 IP 后启动 MQTT。SSID 仍为占位符时不启动网络；错误密码、热点离线
+或 DHCP 超时不会阻止本地任务启动。
 当前还接入了自动 Light Sleep：开头配置电源管理，摄像头检查及每轮采集/推理
 均在电源锁保护下运行；检查或推理结束后关闭摄像头。Wi-Fi 使用
 `WIFI_PS_MIN_MODEM` 协调省电，详情见 [电源管理说明](power-management.md)。
 
 ## 使用前配置
 
-在 `main/main.cpp` 中替换以下占位符：
+把 `main/security_secrets.example.h` 复制成 Git 忽略的 `main/security_secrets.h`，
+填写 SSID、密码、Broker URI、主题。不要在公开源码中保存真实密码或 Token。
+默认配置：
 
 ```cpp
 #define WIFI_SSID       "YOUR_WIFI_SSID"
 #define WIFI_PASS       "YOUR_WIFI_PASSWORD"
 #define MQTT_BROKER_URI "mqtt://broker.emqx.io"
 #define MQTT_TOPIC      "esp32s3/security/alert"
-#define MAX_RETRY       5
 ```
 
 当前 Broker 使用未加密、无项目级鉴权的公共 MQTT 服务，只适合联调。主题也
@@ -25,8 +27,8 @@
 
 ## 报警载荷与内存
 
-每次 `SIGNAL_HUMAN_CONFIRMED` 到达报警任务时，系统先构造并提交 QoS 1
-消息，然后执行原有声光报警。载荷格式如下：
+每次 `SIGNAL_HUMAN_CONFIRMED` 到达时，报警任务先开启蜂鸣器，把报警开始时的
+时间戳用零等待方式交给独立 MQTT 工作任务，并执行 4 秒声光报警。工作任务生成：
 
 ```json
 {"device":"ESP32-S3","alert":"Human Detected","timestamp":123456789}
@@ -37,6 +39,27 @@
 `cJSON_PrintUnformatted()` 分配；本实现的公共退出路径始终执行
 `free(payload)` 和 `cJSON_Delete(root)`。即使 MQTT 未初始化、发布失败或
 JSON 序列化失败，也不会把本轮对象或字符串留到下一轮。
+`Human Detected` 保留约定载荷，但当前确认依据是人脸，不是全身人体模型。
+
+工作任务在 MQTT 连接后调用 `esp_mqtt_client_enqueue(..., 1, 0, true)`；SDK
+复制消息并由内部任务发送，应用任务不直接调用同步 socket 发布。
+
+限制和丢弃策略：
+
+- 应用队列最多 8 条时间戳，加上工作任务当前 1 条；队列满时丢弃新网络报警并记录日志。
+- 等待发送超过 5 分钟的报警丢弃；重启后不会保留这些内存消息。
+- outbox 中编码消息总大小最多 4096 字节，不含每条链表节点/分配器开销；
+  此上限依赖本工作任务是唯一生产者，新增发布者必须共享限流机制。
+- SDK 默认文件设置未确认 outbox 消息 5 分钟过期，并报告删除事件。
+  已有 sdkconfig 需在 menuconfig 核对上述 MQTT 配置。
+- QoS 1 可能重复；它不消除队列满、过期、断电造成的消息丢失。
+
+## 持续重连
+
+事件回调只记录状态，不在回调中阻塞或执行重试循环。网络监督任务串行发起连接，
+每次最多等 10 秒获取 IP；每 5 次失败后冷却 30 秒，其余失败等待 2 秒，
+始终继续尝试。成功后重置重试计数。MQTT 启动失败也会后台重试；正常 MQTT
+断线由 ESP-MQTT 自动恢复。当前最低认证要求为 WPA2，不支持开放热点或企业认证配置。
 
 ## 组件依赖
 
@@ -45,16 +68,16 @@ JSON 序列化失败，也不会把本轮对象或字符串留到下一轮。
 
 ## 联调检查
 
-1. 使用 ESP-IDF 5.0.x 构建并烧录，确认日志先出现 Wi-Fi IP，再出现 MQTT
-   连接和检测框架就绪信息。
+1. 使用 ESP-IDF 5.0.x 构建并烧录，确认 MQTT 在 Wi-Fi IP 后启动；
+   断网/错误密码启动最多等待 30 秒，然后仍能本地检测报警。
 2. 使用 MQTTX、MQTT Explorer 或命令行客户端连接 `broker.emqx.io:1883`，
    订阅 `esp32s3/security/alert`。
 3. 触发 PIR 并让画面出现通过阈值的人脸，确认本地声光报警和 JSON 消息均
    出现，且消息 QoS 为 1。
-4. 暂时断开热点，确认固件记录断线并自动重连；恢复热点后确认重新获得 IP，
+4. 断开热点超过 5 次重试，确认固件继续重试；恢复热点后确认重新获得 IP，
    MQTT 客户端随后自动恢复连接。
 5. 连续触发并观察剩余堆内存，确认没有随报警次数持续下降。还应分别验证
    Broker 离线、错误 Wi-Fi 密码和 DNS 不可用等故障场景。
 
-当前服务器未安装 ESP-IDF/Xtensa 工具链，本阶段只完成源码、依赖和静态
-检查；固件编译、Wi-Fi/MQTT 实机联调和长期内存测试仍需在开发环境完成。
+主机测试只覆盖 API 模拟和内存清理，编译结果见 [审查报告](project-audit.md)。
+Wi-Fi/MQTT 实机联调、Broker 离线时的本地报警延迟和长期内存测试仍需上板完成。

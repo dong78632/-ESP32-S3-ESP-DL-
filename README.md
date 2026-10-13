@@ -4,8 +4,9 @@
 
 当前为第五步开发快照：FreeRTOS 框架、OV2640 初始化/采集、经典 ESP-DL
 两阶段人脸检测、PIR 防抖触发、有源蜂鸣器/LED 报警，以及 Wi-Fi STA 与
-MQTT QoS 1 报警推送已经接入。系统取得 IPv4 地址后才启动 MQTT 和检测任务；
-检测确认后向 `esp32s3/security/alert` 发布 JSON，同时执行约 4 秒声光报警。
+MQTT QoS 1 报警推送已经接入。启动时最多等 30 秒获取 IP；网络不可用时
+仍启动本地检测，并在后台持续重连。MQTT 仅在取得 IP 后启动。
+检测确认后先启动声光报警（约 4 秒），同时由独立任务异步提交 JSON，网络不阻塞报警。
 已加入 40–240 MHz 动态调频与自动 Light Sleep；摄像头按触发初始化和关闭，
 采集/推理期间锁定 240 MHz 并禁止睡眠，空闲时由 Wi-Fi/FreeRTOS 协调睡眠。
 **当前模型检测人脸，不能将这一阶段的效果表述为全身人体或行人检测。**
@@ -24,6 +25,8 @@ MQTT QoS 1 报警推送已经接入。系统取得 IPv4 地址后才启动 MQTT 
 | 输入 | RGB565，QVGA 320×240，单帧缓冲区在 PSRAM |
 | 报警判定 | 合法检测框，且最终 `score > 0.7` |
 
+本次完整审查的缺陷、修复和验证边界见 [审查报告](docs/project-audit.md)。
+
 ESP-DL v2.0 自身的 `idf_component.yml` 指定 `idf: "5.0.*"`。
 因此先前宽泛的“ESP-IDF 5.0 以上”已在本阶段收紧，不能直接使用 ESP-DL
 最新版 v3.x 编译这些经典头文件/API。预编译模型库与工具链也应保持这组版本。
@@ -36,6 +39,10 @@ ESP-DL v2.0 自身的 `idf_component.yml` 指定 `idf: "5.0.*"`。
 ├── README.md
 ├── sdkconfig.defaults
 ├── partitions.csv
+├── dependencies.lock
+├── config/
+│   ├── offline.defaults
+│   └── freenove.defaults
 ├── components/
 │   └── README.md
 ├── docs/
@@ -43,13 +50,19 @@ ESP-DL v2.0 自身的 `idf_component.yml` 指定 `idf: "5.0.*"`。
 │   ├── step4.md
 │   ├── step5.md
 │   ├── power-management.md
-│   └── hardware-bringup.md
+│   ├── hardware-bringup.md
+│   └── project-audit.md
 ├── tests/
-│   └── test_power_lifecycle.py
+│   ├── test_power_lifecycle.py
+│   ├── test_runtime_policy.py
+│   └── test_mqtt_cleanup.py
 └── main/
     ├── CMakeLists.txt
     ├── idf_component.yml
     ├── Kconfig.projbuild
+    ├── app_config.hpp
+    ├── runtime_policy.hpp
+    ├── security_secrets.example.h
     └── main.cpp
 ```
 
@@ -100,9 +113,15 @@ manifest 中的 `esp-dl` Git 依赖，保留 `REQUIRES esp-dl`。详见
    增加少量代码/内存开销。若已有 `sdkconfig`，默认文件不会覆盖其中的值，
    必须到 menuconfig 确认。
 4. **接线**：摄像头引脚不是 ESP32-S3-WROOM 的统一标准，须对照实际板卡。
-5. **自动睡眠**：确认 `CONFIG_PM_ENABLE=y` 和
+5. **自动睡眠**：启用自动睡眠时确认 `CONFIG_PM_ENABLE=y` 和
    `CONFIG_FREERTOS_USE_TICKLESS_IDLE=y`。二者已写入 `sdkconfig.defaults`；
    若已有 `sdkconfig`，仍需在 menuconfig 中启用，默认文件不会覆盖已有值。
+   首次联调可以在 `Security application` 关闭 `Enable automatic light sleep`；
+   也可以关闭 PM 支持，本工程支持该调试构建。
+6. **板型/引脚**：在 `Security application` 选择 Custom 或 Freenove 映射，
+   核对板卡版本，配置 PIR、蜂鸣器、LED 的 GPIO 和有效电平。
+   启动时检查无效/重复 GPIO、Flash/PSRAM 保留引脚及 PSRAM 可用性；
+   不能代替对板载 SD、LED、USB 和外围驱动电路的原理图核查。
 
 | 信号 | 暂定 GPIO |
 | --- | --- |
@@ -120,12 +139,16 @@ ESP32-S3 的摄像头驱动通过 LCD_CAM 生成 XCLK；配置结构中的 LEDC 
 
 ## 第五步验证
 
-烧录前先在 `main/main.cpp` 中替换 `WIFI_SSID` 和 `WIFI_PASS` 占位符。
+烧录前将 `main/security_secrets.example.h` 复制为 `main/security_secrets.h`，
+填写 `WIFI_SSID` 和 `WIFI_PASS`。实际配置文件已被 Git 忽略；不要把密码
+或 GitHub Token 写进源码/提交。未填写 SSID 时自动进入离线模式；也可在
+menuconfig 关闭 `Enable Wi-Fi and MQTT`。
 公共 Broker 和主题仅适合开发验证；多人可能发布或订阅相同主题，正式部署
 应改用带认证与 TLS 的私有 Broker，并为每台设备设置唯一主题。
 
 默认由真实 PIR 高电平触发视觉任务。HC-SR501 上电后先等待约 30–60 秒
-稳定，再测试移动触发。PIR 持续为高电平时，冷却后会再次确认并请求检测。
+稳定，再测试移动触发。固件默认等待 60 秒预热，可在 menuconfig 调整。
+PIR 持续为高电平时，冷却后会再次确认并请求检测。
 
 也可在 menuconfig 的 `Security application` 中启用
 `Capture and infer once after startup (development test)`，启动后会向视觉
@@ -166,9 +189,12 @@ PIR 确认后应看到 `PIR motion confirmed; vision requested`。画面出现�
 - PIR/报警任务使用 `vTaskDelay()` 让出 CPU，不忙等，也不申请图像缓冲区。
 - 报警正常结束或 GPIO 激活/闪烁失败均执行关闭流程；关闭任一路输出失败
   时，每秒重试两路关闭，不开始新的报警轮次。
-- 每次网络报警创建一个 cJSON 对象和序列化字符串；所有成功与失败路径最终
+- MQTT 工作任务每次发送创建一个 cJSON 对象和序列化字符串；所有成功与失败路径最终
   都调用 `free()` 和 `cJSON_Delete()`，不跨报警轮次保留载荷指针。
-- 启动事件位只在三个任务全部创建成功后设置。启动失败时任务尚未初始化
+- 网络报警队列最多 8 个时间戳，另有 1 个工作任务待发项；等待超过 5 分钟丢弃。
+  MQTT outbox 编码消息总大小限制在 4096 字节（不含节点开销），未确认消息
+  按 SDK 配置过期。QoS 1 可能重复交付，不保证断网/重启时零丢失。
+- 启动事件位只在应用任务创建成功后设置。启动失败时任务尚未初始化
   模型，可以先删任务、再释放队列/事件组及未持有的电源锁。摄像头启动检查
   已在创建任务前完成关闭。
 - 不可在运行期直接调用这段“启动失败清理”；FreeRTOS 外部删除 C++ 任务
@@ -184,8 +210,8 @@ PIR 确认后应看到 `PIR motion confirmed; vision requested`。画面出现�
 启动顺序及 JSON 释放路径，并保留前四步的触发、推理和安全关闭逻辑。
 自动睡眠实现已核对 ESP-IDF v5.0.6 PM 接口和摄像头 v2.0.16 驱动；主机测试
 验证了正常、空帧、初始化失败、提前退出、异常和 1000 次循环的资源释放。
-本机未安装 ESP-IDF/Xtensa 工具链，也没有实物，尚未完成固件交叉编译、
-链接、上板联网、Broker 收发、睡眠占比、功耗、实际电平或准确率测量。
+实际交叉编译结果见 [审查报告](docs/project-audit.md)。仍无实物，尚未完成
+上板联网、Broker 收发、睡眠占比、功耗、实际电平或准确率测量。
 
 后续可选增强：真正的全身人体模型；MQTTS、Broker 鉴权与唯一设备主题；
 连续触发稳定性与内存测量；根据实际硬件与场景调整 PIR 及报警策略。

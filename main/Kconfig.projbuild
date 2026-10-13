@@ -1,5 +1,139 @@
 menu "Security application"
 
+    config SECURITY_NETWORK_ENABLED
+        bool "Enable Wi-Fi and MQTT"
+        default y
+        help
+            Disable for offline hardware bring-up. A network outage never
+            disables local detection or sound/light alarms.
+
+    config SECURITY_AUTO_LIGHT_SLEEP
+        bool "Enable automatic light sleep"
+        depends on PM_ENABLE && FREERTOS_USE_TICKLESS_IDLE
+        default y
+        help
+            Disable for first hardware tests without changing PM support.
+            Camera sessions still acquire frequency and sleep locks.
+
+    config SECURITY_PIR_WARMUP_MS
+        int "PIR stabilization time after task startup (ms)"
+        range 0 120000
+        default 60000
+
+    config SECURITY_CAMERA_WARMUP_FRAMES
+        int "Discard frames after camera initialization"
+        range 0 10
+        default 2
+
+    choice SECURITY_BOARD
+        prompt "Camera board pin mapping"
+        default SECURITY_BOARD_CUSTOM
+
+        config SECURITY_BOARD_CUSTOM
+            bool "Custom wiring (verify every pin)"
+
+        config SECURITY_BOARD_FREENOVE
+            bool "Freenove ESP32-S3 WROOM camera board"
+            help
+                Select only after verifying the actual revision matches the
+                manufacturer's pinout. Uses GPIO4/5 for SCCB, GPIO15 for XCLK.
+    endchoice
+
+    config SECURITY_PIR_GPIO
+        int "PIR input GPIO"
+        range 0 48
+        default 1
+
+    config SECURITY_BUZZER_GPIO
+        int "Buzzer output GPIO"
+        range 0 48
+        default 14 if SECURITY_BOARD_FREENOVE
+        default 2
+
+    config SECURITY_LED_GPIO
+        int "External LED output GPIO"
+        range 0 48
+        default 21
+
+    config SECURITY_BUZZER_ACTIVE_LEVEL
+        int "Buzzer active level (0 or 1)"
+        range 0 1
+        default 1
+
+    config SECURITY_LED_ACTIVE_LEVEL
+        int "LED active level (0 or 1)"
+        range 0 1
+        default 1
+
+    menu "Custom camera GPIOs"
+        depends on SECURITY_BOARD_CUSTOM
+
+        config SECURITY_CAM_PWDN
+            int "PWDN (-1 means unused)"
+            range -1 48
+            default -1
+        config SECURITY_CAM_RESET
+            int "RESET (-1 means unused)"
+            range -1 48
+            default -1
+        config SECURITY_CAM_XCLK
+            int "XCLK"
+            range 0 48
+            default 10
+        config SECURITY_CAM_SDA
+            int "SCCB SDA"
+            range 0 48
+            default 40
+        config SECURITY_CAM_SCL
+            int "SCCB SCL"
+            range 0 48
+            default 39
+        config SECURITY_CAM_D7
+            int "D7 / Y9"
+            range 0 48
+            default 48
+        config SECURITY_CAM_D6
+            int "D6 / Y8"
+            range 0 48
+            default 11
+        config SECURITY_CAM_D5
+            int "D5 / Y7"
+            range 0 48
+            default 12
+        config SECURITY_CAM_D4
+            int "D4 / Y6"
+            range 0 48
+            default 14
+        config SECURITY_CAM_D3
+            int "D3 / Y5"
+            range 0 48
+            default 16
+        config SECURITY_CAM_D2
+            int "D2 / Y4"
+            range 0 48
+            default 18
+        config SECURITY_CAM_D1
+            int "D1 / Y3"
+            range 0 48
+            default 17
+        config SECURITY_CAM_D0
+            int "D0 / Y2"
+            range 0 48
+            default 15
+        config SECURITY_CAM_VSYNC
+            int "VSYNC"
+            range 0 48
+            default 38
+        config SECURITY_CAM_HREF
+            int "HREF"
+            range 0 48
+            default 47
+        config SECURITY_CAM_PCLK
+            int "PCLK"
+            range 0 48
+            default 13
+    endmenu
+
     config SECURITY_CAPTURE_ON_BOOT
         bool "Capture and infer once after startup (development test)"
         default n

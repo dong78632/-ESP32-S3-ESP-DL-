@@ -55,7 +55,7 @@ esp_err_t esp_pm_lock_release(esp_pm_lock_handle_t lock) {
     return ESP_OK;
 }
 esp_err_t init_camera() {
-    assert(cpu_lock.count == 1 && awake_lock.count == 1);
+    assert(cpu_lock.count == CONFIG_PM_ENABLE && awake_lock.count == CONFIG_PM_ENABLE);
     assert(!camera_active);
     events.push_back("camera_init");
     if (fail_camera_init) return -1;
@@ -63,7 +63,7 @@ esp_err_t init_camera() {
     return ESP_OK;
 }
 esp_err_t esp_camera_deinit() {
-    assert(cpu_lock.count == 1 && awake_lock.count == 1);
+    assert(cpu_lock.count == CONFIG_PM_ENABLE && awake_lock.count == CONFIG_PM_ENABLE);
     assert(camera_active && !frame_held);
     camera_active = false;
     events.push_back("camera_deinit");
@@ -77,7 +77,7 @@ camera_fb_t *esp_camera_fb_get() {
 }
 void esp_camera_fb_return(camera_fb_t *frame) {
     assert(frame == &frame_buffer && camera_active && frame_held);
-    assert(cpu_lock.count == 1 && awake_lock.count == 1);
+    assert(cpu_lock.count == CONFIG_PM_ENABLE && awake_lock.count == CONFIG_PM_ENABLE);
     frame_held = false;
     events.push_back("frame_return");
 }
@@ -89,6 +89,11 @@ void assert_idle() {
     assert(!camera_active && !frame_held);
 }
 void assert_events(std::vector<std::string> expected) {
+#if !CONFIG_PM_ENABLE
+    expected.erase(std::remove_if(expected.begin(), expected.end(), [](const std::string &e) {
+        return e.find("acquire_") == 0 || e.find("release_") == 0;
+    }), expected.end());
+#endif
     assert(events == expected);
     assert_idle();
     events.clear();
@@ -169,11 +174,13 @@ guards = "\n".join(production_class(name) for name in (
     "VisionPowerGuard", "CameraSessionGuard", "CameraFrameGuard"
 ))
 with tempfile.TemporaryDirectory(prefix="esp32s3-pm-test-") as temp_dir:
-    binary = str(Path(temp_dir) / "test_power_lifecycle")
-    subprocess.run(
-        ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
-         "-x", "c++", "-", "-o", binary],
-        input=preamble + guards + test_body, text=True, check=True,
-    )
-    subprocess.run([binary], check=True)
-print("PASS: frame -> camera -> PM lock cleanup, failures and 1000 cycles")
+    for pm_enabled in (0, 1):
+        binary = str(Path(temp_dir) / f"test_power_lifecycle_{pm_enabled}")
+        subprocess.run(
+            ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+             f"-DCONFIG_PM_ENABLE={pm_enabled}", "-include", "algorithm",
+             "-x", "c++", "-", "-o", binary],
+            input=preamble + guards + test_body, text=True, check=True,
+        )
+        subprocess.run([binary], check=True)
+print("PASS: frame -> camera -> PM lock cleanup, failures and 1000 cycles; PM on/off")

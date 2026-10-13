@@ -1,0 +1,5 @@
+# Offline bring-up: keep local camera/model/PIR/alarm, disable networking and PM.
+CONFIG_SECURITY_NETWORK_ENABLED=n
+CONFIG_SECURITY_AUTO_LIGHT_SLEEP=n
+CONFIG_PM_ENABLE=n
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=n
